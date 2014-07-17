@@ -1,0 +1,447 @@
+#!/usr/bin/python
+#-*- coding: utf-8 -*-
+
+"""
+#=========================================================================
+# Extraction fichier Planet OSM xml
+# Pierre Beland, 07-2014
+
+#=========================================================================
+#=========================================================================
+
+"""
+
+from lxml import etree
+import xmltodict
+import os
+os.chdir('d:\osm\donnees\\')
+
+
+#==============================================================================
+
+#calcul de distance, méthode haversine
+# http://gis.stackexchange.com/questions/44064/how-to-calculate-distances-in-a-point-sequence
+# https://github.com/mlaloux/My-Python-GIS_StackExchange-answers/blob/master/How%20to%20calculate%20distances%20in%20a%20point%20sequence%3F.md
+
+import math
+def haversine(lon1, lat1, lon2, lat2):
+    """
+    Calculate the great circle distance between two points
+    on the earth (specified in decimal degrees)
+    """
+    lon1=float(lon1)
+    lat1=float(lat1)
+    lon2=float(lon2)
+    lat2=float(lat2)
+    # convert decimal degrees to radians
+    lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
+    # haversine formula
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    km = 6367 * c
+    return km
+
+#==============================================================================
+# not used presenly - was to access pair of nodes for way distance colculation
+import itertools
+def pairwise(iterable):
+    """s -> (s0,s1), (s1,s2), (s2, s3), ...
+    see http://docs.python.org/library/itertools.html
+    """
+    a, b = itertools.tee(iterable)
+    b.next()
+    return itertools.izip(a, b)
+
+#==============================================================================
+
+# fast_iter : parsing osm with economizing necessary imagery
+# High-performance XML parsing in Python with lxml
+# Liza Daly's fast_iter. After processing an element, elem, it calls elem.clear() to remove descendants and also removes preceding siblings.
+# http://stackoverflow.com/questions/7171140/using-python-iterparse-for-large-xml-files/7171543#7171543
+# http://www.ibm.com/developerworks/xml/library/x-hiperfparse/
+
+def fast_iter(context, func, *args, **kwargs):
+	"""
+	http://lxml.de/parsing.html#modifying-the-tree
+	Based on Liza Daly's fast_iter
+	http://www.ibm.com/developerworks/xml/library/x-hiperfparse/
+	See also http://effbot.org/zone/element-iterparse.htm
+	"""
+	for event, elem in context:
+		func(elem, *args, **kwargs)
+		# It's safe to call clear() here because no descendants will be
+		# accessed
+		elem.clear()
+		# Also eliminate now-empty references from the root node to elem
+		for ancestor in elem.xpath('ancestor-or-self::*'):
+			while ancestor.getprevious() is not None:
+				del ancestor.getparent()[0]
+	del context
+
+#==============================================================================
+
+class XmlDictConfig(dict):
+    '''
+	source : http://code.activestate.com/recipes/410469-xml-as-dictionary/
+    Example usage:
+
+    >>> tree = ElementTree.parse('your_file.xml')
+    >>> root = tree.getroot()
+    >>> xmldict = XmlDictConfig(root)
+
+    Or, if you want to use an XML string:
+
+    >>> root = ElementTree.XML(xml_string)
+    >>> xmldict = XmlDictConfig(root)
+
+    And then use xmldict for what it is... a dict.
+    '''
+    def __init__(self, parent_element):
+        if parent_element.items():
+            self.update(dict(parent_element.items()))
+        for element in parent_element:
+            if len(element)>0:
+                # treat like dict - we assume that if the first two tags
+                # in a series are different, then they are all different.
+                if len(element) == 1 or element[0].tag != element[1].tag:
+                    aDict = XmlDictConfig(element)
+                # treat like list - we assume that if the first two tags
+                # in a series are the same, then the rest are the same.
+                else:
+                    # here, we put the list in dictionary; the key is the
+                    # tag name the list elements all share in common, and
+                    # the value is the list itself
+                    aDict = {element[0].tag: XmlListConfig(element)}
+                # if the tag has attributes, add those to the dict
+                if element.items():
+                    aDict.update(dict(element.items()))
+                self.update({element.tag: aDict})
+            # this assumes that if you've got an attribute in a tag,
+            # you won't be having any text. This may or may not be a
+            # good idea -- time will tell. It works for the way we are
+            # currently doing XML configuration files...
+            elif element.items():
+                self.update({element.tag: dict(element.items())})
+            # finally, if there are no child tags and no attributes, extract
+            # the text
+            else:
+                self.update({element.tag: element.text})
+
+#==============================================================================
+# Main routine
+#==============================================================================
+
+import re
+node_poi_cat=["amenity","shop","craft","office","power","place","man_made","history","tourism","leisure"]
+way_cat=["highway","waterway","building","landuse","man_made"]
+#poi_inclu=["highway", "ford", "route", "ferry_route", "hicking_route", "cycleway", "traffic_calming", "barrier", "waterway", "railway", "aeroway", "aerialway", "power", "man_made", "leisure", "office", "amenity", "shop", "tourism", "historic", "landuse", "natural", "military", "internet_access", "place", "boundary", "sport"]
+node_poi_inclu=["^highway$", "^ford$","^route$","^ferry_route$","^hicking_route$","^cycleway$","^traffic_calming$","^barrier$","^waterway$","^railway$","^aeroway$","^aerialway$","^power$","^man_made$","^leisure$","^office$","^amenity$","^shop$","^tourism$","^historic$","^landuse$","^natural$","^military$","^internet_access$","^place$","^boundary$","^sport$"]
+pattern = re.compile("|".join(node_poi_inclu), re.IGNORECASE)
+tot_poi_node={}
+tags=[]
+dict_node={}
+# "echant.osm"  ,  "TM-Job-Daru-Kailahun.osm"   ,  "mali-ansango.osm" , "mithi-pakistan.osm" , "burkina_faso-2014-06-09-osmosis.osm"
+# "bosnia-herzegovina-2014-05-21.osm.bz2"
+# discusson parsing etree http://chimera.labs.oreilly.com/books/1230000000393/ch06.html#_discussion_96
+
+### Fichier Planet Input
+
+import bz2
+# 16384*64
+#fichier_osm_bz2="burkina_faso-2014-06-09-osmosis.osm.bz2"
+#fichier_osm = bz2.BZ2File(fichier_osm_bz2, "rb",16384*64)
+#fichier_osm="mithi-pakistan.osm"
+#fichier_osm="echant.osm"
+fichier_osm="burkina_faso_echant.osm"
+fichier_osm="burkina_faso-2014-06-09-osmosis.osm"
+fichier_osm="burkina_faso-2014-06-09-osmosis-complet.osm"
+
+#logtxt = open("log.txt", 'wb')
+# step 1 - parse osm nodes, create node stats and save node coordinates in memory - might create memory problems
+# Problem to correct  - error messages in step 2 trying to find nodes -
+# Message - ** ERROR, Node missing id=xxxxxxxxx
+
+print "OsmPlanetStats"
+node_burkina_debug=[2453706308, 329502921, 306400383, 329971281, 330053226, 2197081859, 330448711, 347622125, 651257942, 434416703, 434425726, 442147150, 2826246674, 461133602, 461140036, 471242483, 471242674, 471242680, 473484057, 473484081, 473485718, 473496276, 473496379, 916923138, 2330379639, 504485683, 504489683, 355157132, 504487180, 504490628, 922831713, 504488287, 504489685, 504492386, 504491927, 504487097, 504494464, 504490532, 504490628, 504487262, 504492976, 504485717, 505825301, 2132960418, 915619061, 434404294, 915618990, 917275993, 1986273631, 919688487, 917151595, 504526381, 1598314767, 1825843595, 917330926, 918877867, 918891228, 920836232, 920836191, 1866591621, 504486154, 434402677, 917151613, 917229961, 504491983, 936245470, 936249492, 936294584, 918891239, 937813002, 1118501212, 1865351403, 1595389559, 1707686793, 1707685157, 1707685580, 1707686531, 1717042730, 1761680576, 329971303, 916338699, 1824159272, 1824159204, 917194593, 498310736, 1827474875, 1598314785, 784786800, 1866462075, 1869131218, 2135499946, 1869131114, 1869202802, 1869295951, 1869393378, 1870453076, 1870635770, 1871850606, 1894020675, 1894027539, 1923247922, 1934498411, 1934498584, 1934498572, 1934498560, 1934498581, 1934498397, 1982852501, 1986269580, 1986609079, 2003842798, 383963131, 2028051735, 2028051018, 2028051509, 2028051479, 2034336317, 2053166332, 2053166418, 2053166128, 2053206898, 2053206898, 2057230523, 504494856, 2105438919, 2105449626, 2105442069, 2105484687, 2057229616, 442199963, 2123271268, 2132960363, 2132960412, 2248034135, 2248034177, 2248034449, 329971609, 2248034100, 2148337848, 2295251462, 322546936, 2295756753, 2295756637, 2295756708, 2028051594, 2028051577, 916167964, 2295756827, 2329364806, 2053166103, 2221551620, 920848065, 2386690455, 936249154, 2401960129, 2402891374, 2436294043, 2436331383, 2436305856, 2436305861, 2436279611, 2436305936, 2436317506, 2436297619, 2436303277, 2438723824, 2438938472, 2438936314, 2438954139, 2438723340, 936969770, 2438927020, 2438887882, 2438923272, 2438903916, 2438955471, 2439677056, 2148420395, 2444177001, 2444174173, 2444178187, 2444171237, 2444178555, 2444171113, 2444171053, 2452453568, 2452456052, 2452456042, 2452474667, 2454636349, 2454636343, 2454662113, 2454661968, 2558213793, 2454708113, 2454707732, 2454739679, 2454740165, 2454740079, 2454827535, 2454827498, 2463475624, 2463484968, 504487360, 1707686521, 2469616827, 2469781266, 2469794768, 2469779762, 2469779758, 1707686295, 2470040131, 2470040845, 2493256761, 2493312032, 2493312071, 504495176, 2454827375, 2533391674, 2534624841, 2534624958, 2534625665, 2534624930, 2534625565, 2534624758, 2534625656, 330443314, 620882354, 2558213914, 330447336, 2623399708, 2676664592, 2676664209, 2676839032, 2694483191, 1601205932, 2757390268, 2775849538, 2794249101, 1923247927, 442215132, 2822673099, 2822675560, 2822675586, 2822820991, 2822767982]
+
+nb=0
+nb_obj=0
+# parse osm node elements
+for event, element in etree.iterparse(fichier_osm, tag="node", events=("end", )):
+	nb+=1
+	xmldict = XmlDictConfig(element)
+	id=xmldict["id"]
+	if id in node_burkina_debug:
+		print "--> verif node present dans le fichier pour certains id non sauvegardés, id=", id
+	dict_node[id]={}
+	#logtxt.write(id+"\n")
+	#logtxt.flush()
+	obj={}
+	for k,v in  element.items():
+		obj[k]=v
+	# # print "node obj ",obj
+	if len(obj)>0:
+		# enlevé pour économiser mémoire
+		# dict_node[id]["obj"]=obj
+		nb_obj+=1
+		# store in memory coordinates for each node (will be used to calculated distances for ways)
+		dict_node[id]["obj"]={"lat": obj["lat"], "lon": obj["lon"]}
+	else: print "** WARNING, no obj id=", id
+	#if id in node_burkina_debug:
+		#print "--> verif dic_node pour certains id non sauvegardés, dict_node id=", dict_node[id]
+	nodetag={}
+	nodepoi={}
+	node_name=""
+	poi=""
+	# # print ("children ", element.getchildren())
+	for child in element:
+		#tag_node_building=""
+		if child.attrib["k"]=="name" :
+			node_name=child.attrib["v"]
+		#elif child.attrib["k"]=="building" :
+		#	tag_node_building=child.attrib["k"]+"|"+child.attrib["v"]
+  			#print "node_name=",node_name
+		if child.attrib["k"] not in tags: tags.append(child.attrib["k"])
+		nodetag[child.attrib["k"]]=child.attrib["v"]
+		#if nb<15 : print "id=", id, "notetag=", nodetag
+		# stats poi node
+		# search if the tag is in the list of tags retained as POI; if so, add the tag to nodepoi
+		# ==> tot_poi_node
+		if pattern.search(child.attrib["k"].lower()):
+			nodepoi[child.attrib["k"]]=child.attrib["v"]
+	#if id in ['306551810', '306551853', '306551854', '306551855', '306551810'] : print "id=", id, "obj=", obj, "notetag=", nodetag, "nodepoi=", nodepoi
+	#if len(nodetag)>0 : print "id=", id, "notetag=", nodetag, "nodepoi=", nodepoi
+
+	# poi default value if no tag
+	poi="|_node| "
+	# poi - pairs of key - values
+	# ### revision necessary ??? - some prioritity to be applied, for example 1. amenity, 2. shop, 3. man_made, 4. building, etc.
+	if  len(nodepoi):
+		poi="|_node| other"
+		liste=nodepoi.keys()
+		for cle in liste:
+			if cle in node_poi_cat :
+   			   poi="|"+cle + "| " + nodepoi[cle]
+			   #print"1. debug node, poi=",poi
+			   break
+		#print "ncat ", ncatp
+
+
+	for k,v in nodepoi.items():
+	   # precedence of other tags over building - building considered as poi only if no other tag
+	   # we skip at this step
+		if not k=="building": poi+="|"+k+"|"+v
+  		#print"2. debug node, poi=",poi
+	# adding building at the end + classif tags
+	if "building" in nodetag.keys():
+	   # precedence of other tags over building - building is now considered as poi since no other tag
+  		#print"3a. debug node, poi=",poi
+		if poi=="|_node": poi="building"
+		poi+="|"+"building|"+nodetag["building"]
+  		#print"3b. debug node, poi=",poi
+	# if no tags except then name, etc. indicate as notag poi - let's validate inconsistencies, incomplete tagging
+	if poi=="": poi="|node|notag"
+	if not (poi in tot_poi_node):
+		tot_poi_node[poi]={"nb":0,"nb_name":0}
+	tot_poi_node[poi]["nb"]+=1
+	if len(node_name)>0 and not (poi=="|node|notag"):
+		#print node_name
+		if (poi in tot_poi_node):
+			tot_poi_node[poi]["nb_name"]=1
+		else:
+			print "*** WARNING: node name with no poi tag [", poi, "]", nodetag
+	# ### reduction memoire - enleve pour stats if nodetag: dict_node[id]["tag"]=nodetag
+	# # print ("id, dict_node[id] ", id, dict_node[id])
+	# # print ("="*80)
+
+nb_dict_node=len(dict_node)
+# note : using Osmosis without completeWays instruction, cut ways at the  polygon limits. But nodes are still specified in the way list of nodes
+# ND Ref : missing nodes, we ignore distance calculation
+# print "debug nb of nodes=", nb, " vs nb with obj-coordinates=", nb_obj, " vs items in dict_node", nb_dict_node
+
+# print stats poi nodes
+# Revision - Method to be applied to assure automatic production of stats for a list of countries, saving in a file
+print "\nobject|km|km_name|nb|nb_name|cat|val|poi|tag|poi2|tag2|poi3|tag3"
+for poi in tot_poi_node.iterkeys():
+	print "node | 0.0| 0.0|", tot_poi_node[poi]["nb"], "|", tot_poi_node[poi]["nb_name"], poi
+
+"""
+print "\ndict_node nodes\n","="*80
+for ligne in dict_node:
+    if "tag" in dict_node[ligne].keys():
+	   #condition temporaires -nodes avec attribut seulement
+		#print("\nnode", dict_node[ligne])
+		print"\nnode"
+		if "tag" in dict_node[ligne].keys(): print ("   ===tag ", dict_node[ligne]["tag"])
+		if "obj" in dict_node[ligne].keys(): print ("   ===obj ", dict_node[ligne]["obj"])
+
+"""
+
+#import sys
+#sys.exit('\n   FIN\n'+'\b'*80+'\n')
+
+# ##############################################################################
+#fichier_osm.close()
+#fichier_osm = bz2.BZ2File(fichier_osm_bz2, "rb",16384*64)
+#fichier_osm="echant.osm"
+#fichier_osm="burkina_faso-2014-06-09-osmosis.osm"
+# Step 2 - parse ways + ways stats
+
+way_poi_inclu=["^building$","^highway$", "^ford$","^route$","^ferry_route$","^hicking_route$","^cycleway$","^traffic_calming$","^barrier$","^waterway$","^railway$","^aeroway$","^aerialway$","^power$","^man_made$","^leisure$","^office$","^amenity$","^shop$","^tourism$","^historic$","^landuse$","^natural$","^military$","^internet_access$","^place$","^boundary$","^sport$"]
+pattern = re.compile("|".join(way_poi_inclu), re.IGNORECASE)
+tot_poi_way={}
+dict_way={}
+nb=0
+# parse osm  elements
+for event, element in etree.iterparse(fichier_osm, tag="way", events=("end", )):
+	nb+=1
+	xmldict = XmlDictConfig(element)
+	id=xmldict["id"]
+	dict_way[id]={}
+	dict_way[id]["type"]="way"
+	obj={}
+	for k,v in  element.items():
+		obj[k]=v
+	# # print "node obj ",obj
+	if obj:
+		dict_way[id]["obj"]=obj
+	waytag={}
+	waypoi={}
+	way_name=""
+	ndref=[]
+	# # print ("children ", element.getchildren())
+	for child in element:
+		if child.tag=='nd':
+			#xmlchild = XmlDictConfig(child)
+			#ndref.append(xmlchild['ref'])
+			# # print "**way child ", child
+			for k,v in child.items():
+				# # print "** way child k,v ",k,v
+				ndref.append(v)
+				#print "id=",v, "lat, lon =", dict_node[v]["obj"]["lat"],dict_node[v]["obj"]["lon"]
+		if child.tag=='tag':
+			# # print "**way child ", child
+			for k,v in child.items():
+				# # print "** way child k,v ",k,v
+				if k=="k": kk=v
+				if k=="v": vv=v
+				if kk=="name" :
+					way_name=vv
+
+				# stats poi way
+	        	if pattern.search(kk.lower()):
+					# ==> tot_poi_way
+					#poi=kk+"|"+vv
+					waypoi[kk]=vv
+
+			# ### reduction memoire - enleve pour stats if kk not in tags: tags.append(kk)
+			waytag[kk]=vv
+				#nodetag[child.tag.attrib["k"]]=child.tag.attrib["v"]
+				#xmlchild = XmlDictConfig(child)
+				#ndref.append(xmlchild['ref'])
+	poi="|_way"
+	if  len(nodepoi):
+		poi="|_way other"
+		liste=waypoi.keys()
+		for cle in liste:
+			if cle in way_cat :
+   			   poi="|"+cle + "| " + waypoi[cle]
+			   break
+		#print "ncat ", ncat
+
+
+	for k,v in waypoi.items():
+		poi+="|"+k+"|"+v
+	if poi=="": poi="|way|notag"
+	if not (poi in tot_poi_way):
+		tot_poi_way[poi]={"nb":0,"nb_name":0,"km":0.0,"km_name":0.0}
+	tot_poi_way[poi]["nb"]+=1
+	if len(way_name)>0:
+		#print node_name
+		if (poi in tot_poi_way) and not (poi=="|way|notag"):
+			tot_poi_way[poi]["nb_name"]+=1
+		else:
+			print "*** WARNING: way name with no poi tag ", waytag
+	if ndref: dict_way[id]["nd"]=ndref
+	if waytag: dict_way[id]["tag"]=waytag
+	# # print ("id, dict_way[id] ", id, dict_way[id])
+	# # print ("="*80)
+	#if nb<5:
+	   #print "\nobj=", obj
+	   #print  "ndref ", ndref
+	   #print "waytag ", waytag
+
+	#calcul de distance haversine
+	#print "pairwise(ndref)"
+	if len(ndref)>0 and (waytag.has_key("waterway") or waytag.has_key("highway")):
+		km=0.0
+		#print "\nid=", id
+		for pair in pairwise(ndref):
+			#print pair[0]
+			#print pair[0]["obj"]["lon"]
+			# note : using Osmosis without completeWays instruction, cut ways at the  polygon limits. But nodes are still specified in the way list of nodes
+			# ND Ref : missing nodes, we ignore distance calculation
+			if not dict_node.has_key(pair[0]):
+				# print "** ERROR, way id=",id , "Node missing id=" + str(pair[0])
+				#raise ValueError, '** Node missing id ' + str(pair[0])
+				break
+			if not dict_node.has_key(pair[1]):
+				# print "** ERROR, way id=",id , "Node missing id=" + str(pair[1])
+				#raise ValueError, '** Node missing id ' + str(pair[1])
+				break
+			try:
+				pair0=dict_node[pair[0]]
+			except ValueError: "Node missing id=" + str(pair[0])
+			try:
+				pair1=dict_node[pair[1]]
+			except ValueError: "Node missing id=" + str(pair[1])
+			try:
+				lon1=dict_node[pair[0]]["obj"]["lon"]
+			except ValueError: "Node missing id=" + str(pair[0])
+			try:
+				lat1=dict_node[pair[0]]["obj"]["lat"]
+			except ValueError: "Node missing id=" + str(pair[0])
+			try:
+				lon2=dict_node[pair[1]]["obj"]["lon"]
+			except ValueError: "Node missing id=" + str(pair[1])
+			try:
+				lat2=dict_node[pair[1]]["obj"]["lat"]
+			except ValueError: "Node missing id=" + str(pair[1])
+			#km=([pair[0]]["obj"]["lon"], [pair[0]]["obj"]["lat"], [pair[1]]["obj"]["lon"], [pair[1]]["obj"]["lat"])
+
+	#####################################################################
+	# calcul km, pour highway et waterway seulement, ajouter km_name
+	#####################################################################
+			km_s=haversine(lon1, lat1, lon2, lat2)
+			km+=km_s
+			#print "nkm_s=",km_s, "km=", km, "paire ", dict_node[pair[0]]["obj"], dict_node[pair[1]]["obj"]
+		tot_poi_way[poi]["km"]+=km
+		# print "tot_poi_way[poi][km] ", tot_poi_way[poi]["km"]
+		if tot_poi_way[poi]["nb_name"]>0:
+		   tot_poi_way[poi]["km_name"]=km
+	# ### probleme de mémoire on efface apres traitement
+	dict_way.pop(id)
+# stats poi ways
+
+#print "\nobject|nb|nb_name|poi|tag|poi2|tag2|poi3|tag3"
+###print dict_way[id]["tag"]
+for poi in tot_poi_way.iterkeys():
+	print "way |", tot_poi_way[poi]["km"], "|",tot_poi_way[poi]["km_name"], "|", tot_poi_way[poi]["nb"], "|", tot_poi_way[poi]["nb_name"], poi
+
+"""
+#print "\ndict_way ways\n","="*80
+for ligne in dict_way:
+	#print("way", dict_way[ligne])
+	print"\nchemin"
+	if "tag" in dict_way[ligne].keys(): print ("   ===tag ", dict_way[ligne]["tag"])
+	if "obj" in dict_way[ligne].keys(): print ("   ===obj ", dict_way[ligne]["obj"])
+	if "nd" in dict_way[ligne].keys(): print ("   ===nd  ", dict_way[ligne]["nd"])
+
+print "\nTags ","="*80, "\n", tags
+
+"""
+
+import sys
+sys.exit('\n   FIN\n'+'\b'*80+'\n')
